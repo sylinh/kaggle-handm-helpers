@@ -57,6 +57,23 @@ def create_last_customer_weeks_and_pairs(
     transactions_df, article_pairs_df, num_weeks, num_pair_weeks, customers
 ):
     clw_df = transactions_df[["customer_id", "article_id", "t_dat"]].copy()
+    # thống kê giá để tính price-fit/discount cho cặp customer - article pair
+    price_stats_df = (
+        transactions_df.groupby("article_id")[["price"]]
+        .agg(["mean", "max"])
+        .reset_index()
+    )
+    price_stats_df.columns = [
+        "article_id",
+        "pair_article_mean_price",
+        "pair_article_max_price",
+    ]
+    cust_price_stats_df = (
+        transactions_df.groupby("customer_id")[["price"]]
+        .agg(["mean", "max"])
+        .reset_index()
+    )
+    cust_price_stats_df.columns = ["customer_id", "cust_price_mean", "cust_price_max"]
     if customers is not None:
         clw_df = clw_df[clw_df["customer_id"].isin(customers)]
 
@@ -107,6 +124,8 @@ def create_last_customer_weeks_and_pairs(
                 "last_ca_purchase_diff",
                 "customer_count",
                 "percent_customers",
+                "pair_percent_customers",
+                "lift",
             ]
         ]
         .max()
@@ -120,6 +139,8 @@ def create_last_customer_weeks_and_pairs(
         "pair_last_ca_purchase_diff",
         "pair_customer_count",
         "pair_percent_customers",
+        "pair_reverse_percent_customers",
+        "pair_lift",
     ]
     clw_pairs_df = clw_pairs_df.query("pair_customer_count > 2").copy()
 
@@ -127,6 +148,46 @@ def create_last_customer_weeks_and_pairs(
     cust_last_week_pair_cand = clw_pairs_df[
         ["customer_id", "article_id"]
     ].drop_duplicates()
+
+    pair_price_mean_map = price_stats_df.set_index("article_id")[
+        "pair_article_mean_price"
+    ]
+    pair_price_max_map = price_stats_df.set_index("article_id")[
+        "pair_article_max_price"
+    ]
+    cust_price_mean_map = cust_price_stats_df.set_index("customer_id")[
+        "cust_price_mean"
+    ]
+    cust_price_max_map = cust_price_stats_df.set_index("customer_id")[
+        "cust_price_max"
+    ]
+
+    clw_pairs_df["pair_article_mean_price"] = clw_pairs_df["article_id"].map(
+        pair_price_mean_map
+    )
+    clw_pairs_df["pair_article_max_price"] = clw_pairs_df["article_id"].map(
+        pair_price_max_map
+    )
+    clw_pairs_df["cust_price_mean"] = clw_pairs_df["customer_id"].map(
+        cust_price_mean_map
+    )
+    clw_pairs_df["cust_price_max"] = clw_pairs_df["customer_id"].map(
+        cust_price_max_map
+    )
+    clw_pairs_df["pair_price_fit"] = (
+        clw_pairs_df["pair_article_mean_price"] - clw_pairs_df["cust_price_mean"]
+    )
+    clw_pairs_df["pair_discount_sensitivity"] = 1 - (
+        clw_pairs_df["pair_article_mean_price"]
+        / clw_pairs_df["pair_article_max_price"]
+    )
+    # fill giá trị mặc định cho các cặp ko có thống kê giá
+    clw_pairs_df = clw_pairs_df.fillna(
+        {
+            "pair_price_fit": 0,
+            "pair_discount_sensitivity": 0,
+        }
+    )
 
     clw_df = clw_df.set_index(["customer_id", "article_id"])[
         ["ca_count", "last_ca_purchase_date", "last_ca_purchase_diff"]
@@ -140,6 +201,14 @@ def create_last_customer_weeks_and_pairs(
             "pair_last_ca_purchase_diff",
             "pair_customer_count",
             "pair_percent_customers",
+            "pair_reverse_percent_customers",
+            "pair_lift",
+            "pair_article_mean_price",
+            "pair_article_max_price",
+            "cust_price_mean",
+            "cust_price_max",
+            "pair_price_fit",
+            "pair_discount_sensitivity",
         ]
     ].copy()
     pair_features = (["customer_id", "article_id"], clw_pairs_df)

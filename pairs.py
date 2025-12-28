@@ -15,6 +15,8 @@ def cudf_groupby_head(df, groupby, head_count):
 def create_pairs(transactions_df, week_number, pairs_per_item, verbose=True):
     # get the dfs
     working_t_df = transactions_df[["customer_id", "article_id", "week_number"]].copy()
+    # đếm tổng khách để tính lift
+    total_customers = working_t_df["customer_id"].nunique()
 
     # we'll look for pairs in last week only
     working_t_df = working_t_df.query(f"week_number <= {week_number}").copy()
@@ -45,6 +47,12 @@ def create_pairs(transactions_df, week_number, pairs_per_item, verbose=True):
         all_cust_counts = all_cust_counts.reset_index()
         all_cust_counts.columns = ["article_id", "all_customer_counts"]
         all_cust_counts["all_customer_counts"] -= 1  # not him himself
+
+        # get total # of customers who bought the paired article (phuc vu conf B->A va lift)
+        pair_all_cust_counts = pairs_t_df.groupby("pair_article_id")["customer_id"].nunique()
+        pair_all_cust_counts = pair_all_cust_counts.reset_index()
+        pair_all_cust_counts.columns = ["pair_article_id", "pair_all_customer_counts"]
+        pair_all_cust_counts["pair_all_customer_counts"] -= 1
 
         # get all pairs for those articles (other articles those customers bought)
         batch_pairs_df = batch_t.merge(pairs_t_df, on="customer_id")
@@ -82,10 +90,31 @@ def create_pairs(transactions_df, week_number, pairs_per_item, verbose=True):
 
         # calculate percentage statistic
         batch_pairs_df = batch_pairs_df.merge(all_cust_counts, on="article_id")
+        batch_pairs_df = batch_pairs_df.merge(
+            pair_all_cust_counts, on="pair_article_id", how="left"
+        )
+        batch_pairs_df["pair_all_customer_counts"] = batch_pairs_df[
+            "pair_all_customer_counts"
+        ].fillna(1)
+
+        # confidence A->B (existing)
         batch_pairs_df["percent_customers"] = (
             batch_pairs_df["customer_count"] / batch_pairs_df["all_customer_counts"]
         )
-        del batch_pairs_df["all_customer_counts"]
+
+        # confidence B->A (dao nguoc)
+        batch_pairs_df["pair_percent_customers"] = (
+            batch_pairs_df["customer_count"]
+            / batch_pairs_df["pair_all_customer_counts"]
+        )
+
+        # lift su dung ty le khach toan cuc
+        support = batch_pairs_df["customer_count"] / total_customers
+        prob_a = batch_pairs_df["all_customer_counts"] / total_customers
+        prob_b = batch_pairs_df["pair_all_customer_counts"] / total_customers
+        batch_pairs_df["lift"] = support / (prob_a * prob_b + 1e-6)
+
+        del batch_pairs_df["all_customer_counts"], batch_pairs_df["pair_all_customer_counts"]
 
         batch_pairs_dfs.append(batch_pairs_df)
 
