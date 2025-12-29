@@ -383,6 +383,323 @@ def create_age_bucket_candidates(
         (["customer_id", "article_id"], bucket_counts_df),
     )
 
+def create_graph_based_embedding_candidates(
+    transactions_df,
+    num_weeks=12,
+    label_week=None,                 # <-- thêm để CV không leakage
+    embedding_dim=64,
+    n_layers=2,
+    epochs=3,
+    lr=2e-3,
+    weight_decay=1e-6,
+    num_articles=200,
+    min_transactions=3,
+    customers=None,                  # customers to generate candidates for
+    max_customers=None,
+    sample_customers=False,
+    use_cache=True,
+    cache_path="lightgcn_cache.pt",
+    batch_size=32768,                # BPR batch edges
+    neg_k=1,
+    retrieval_batch_users=256,       # retrieval batch users
+    device=None,
+    verbose=True,
+):
+    """
+    Proper LightGCN (BPR-trained) for candidate retrieval.
+
+    Returns:
+      graph_candidates: DataFrame [customer_id, article_id]
+      graph_features: (["customer_id","article_id"], feature_df indexed by keys)
+                      columns: gcn_score, gcn_rank
+    """
+    import os
+    import numpy as np
+
+    # --- optional cudf support ---
+    try:
+        import cudf
+        _HAS_CUDF = True
+    except Exception:
+        cudf = None
+        _HAS_CUDF = False
+
+    import pandas as pd
+    import torch
+    import torch.nn as nn
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ----------------------------
+    # 1) Prepare training data (no leakage if label_week provided)
+    # ----------------------------
+    t = transactions_df
+    if "cudf" in str(type(t)):
+        t = t.to_pandas()
+    else:
+        t = t.copy()
+
+    need_cols = ["customer_id", "article_id", "week_number"]
+    missing = [c for c in need_cols if c not in t.columns]
+    if missing:
+        raise ValueError(f"transactions_df thiếu cột: {missing}")
+
+    if label_week is None:
+        # default: use last_week as "current" and train on last num_weeks weeks
+        label_week = int(t["week_number"].max()) + 1
+
+    start_week = int(label_week - num_weeks)
+    end_week = int(label_week - 1)
+
+    t = t[(t["week_number"] >= start_week) & (t["week_number"] <= end_week)]
+    if customers is not None:
+        # keep only these customers for training graph (optional)
+        t = t[t["customer_id"].isin(customers)]
+
+    # binary implicit edges
+    t = t[["customer_id", "article_id"]].drop_duplicates()
+
+    # filter customers by min_transactions (within window)
+    cust_cnt = t.groupby("customer_id").size()
+    valid_customers = cust_cnt[cust_cnt >= min_transactions].index
+
+    if max_customers is not None and len(valid_customers) > max_customers:
+        if sample_customers:
+            rng = np.random.RandomState(42)
+            valid_customers = rng.choice(valid_customers, size=max_customers, replace=False)
+        else:
+            valid_customers = cust_cnt.loc[valid_customers].nlargest(max_customers).index
+
+    t = t[t["customer_id"].isin(valid_customers)]
+    if len(t) == 0:
+        empty = cudf.DataFrame(columns=["customer_id", "article_id"]) if _HAS_CUDF else pd.DataFrame(columns=["customer_id", "article_id"])
+        empty_feat = cudf.DataFrame() if _HAS_CUDF else pd.DataFrame()
+        return empty, (["customer_id", "article_id"], empty_feat)
+
+    # factorize to contiguous indices
+    u_codes, u_uniques = pd.factorize(t["customer_id"], sort=True)
+    i_codes, i_uniques = pd.factorize(t["article_id"], sort=True)
+
+    edge_u = u_codes.astype(np.int64)
+    edge_i = i_codes.astype(np.int64)
+    n_users = int(u_uniques.size)
+    n_items = int(i_uniques.size)
+    nnz = int(edge_u.shape[0])
+
+    if verbose:
+        print(f"[LightGCN] window weeks: [{start_week}, {end_week}] (label_week={label_week})")
+        print(f"[LightGCN] edges(nnz)={nnz:,} | users={n_users:,} | items={n_items:,} | dim={embedding_dim} | layers={n_layers} | epochs={epochs}")
+        print(f"[LightGCN] device={device}")
+
+    # bought dict for filtering retrieval
+    tmp_ui = pd.DataFrame({"u": edge_u, "i": edge_i})
+    bought_dict = tmp_ui.groupby("u")["i"].apply(lambda x: np.unique(x.values)).to_dict()
+
+    # ----------------------------
+    # 2) Build normalized interaction (torch sparse COO): R_norm[u,i] = 1/sqrt(deg_u*deg_i)
+    # ----------------------------
+    def build_R_norm(edge_u_np, edge_i_np, U, I, dev):
+        eu = torch.from_numpy(edge_u_np).to(dev)
+        ei = torch.from_numpy(edge_i_np).to(dev)
+
+        deg_u = torch.bincount(eu, minlength=U).float()
+        deg_i = torch.bincount(ei, minlength=I).float()
+        deg_u = torch.clamp(deg_u, min=1.0)
+        deg_i = torch.clamp(deg_i, min=1.0)
+
+        w = 1.0 / torch.sqrt(deg_u[eu] * deg_i[ei])
+        idx = torch.stack([eu, ei], dim=0)
+        return torch.sparse_coo_tensor(idx, w, size=(U, I), device=dev).coalesce()
+
+    # ----------------------------
+    # 3) LightGCN model (proper propagation) + BPR training
+    # ----------------------------
+    class _LightGCN(nn.Module):
+        def __init__(self, U, I, D, K):
+            super().__init__()
+            self.U, self.I, self.D, self.K = U, I, D, K
+            self.user_emb = nn.Embedding(U, D)
+            self.item_emb = nn.Embedding(I, D)
+            nn.init.normal_(self.user_emb.weight, std=0.02)
+            nn.init.normal_(self.item_emb.weight, std=0.02)
+            self.R_norm = None
+
+        def set_R_norm(self, Rn):
+            self.R_norm = Rn.coalesce()
+
+        def propagate(self):
+            u0 = self.user_emb.weight
+            i0 = self.item_emb.weight
+            u_list = [u0]
+            i_list = [i0]
+            u_k, i_k = u0, i0
+
+            for _ in range(self.K):
+                u_next = torch.sparse.mm(self.R_norm, i_k)
+                i_next = torch.sparse.mm(self.R_norm.transpose(0, 1), u_k)
+                u_k, i_k = u_next, i_next
+                u_list.append(u_k)
+                i_list.append(i_k)
+
+            u_final = torch.stack(u_list, dim=0).mean(dim=0)
+            i_final = torch.stack(i_list, dim=0).mean(dim=0)
+            return u_final, i_final
+
+    # cache key (avoid leakage / wrong reuse)
+    cache_key = f"lw{label_week}_nw{num_weeks}_U{n_users}_I{n_items}_nnz{nnz}_d{embedding_dim}_L{n_layers}_ep{epochs}_lr{lr}"
+    cache_obj = None
+    if use_cache and os.path.exists(cache_path):
+        try:
+            ckpt = torch.load(cache_path, map_location="cpu")
+            if isinstance(ckpt, dict) and ckpt.get("cache_key") == cache_key:
+                cache_obj = ckpt
+                if verbose:
+                    print(f"[LightGCN] Loaded cache: {cache_path}")
+        except Exception:
+            cache_obj = None
+
+    model = _LightGCN(n_users, n_items, embedding_dim, n_layers).to(device)
+    R_norm = build_R_norm(edge_u, edge_i, n_users, n_items, device)
+    model.set_R_norm(R_norm)
+
+    if cache_obj is None:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        edge_u_t = torch.from_numpy(edge_u)
+        edge_i_t = torch.from_numpy(edge_i)
+        steps = (nnz + batch_size - 1) // batch_size
+
+        model.train()
+        for ep in range(1, epochs + 1):
+            perm = torch.randperm(nnz)
+            # propagate once per epoch (fast, common trick)
+            u_final, i_final = model.propagate()
+
+            total_loss = 0.0
+            for st in range(steps):
+                idx = perm[st * batch_size : (st + 1) * batch_size]
+                u = edge_u_t[idx].to(device, non_blocking=True)
+                i_pos = edge_i_t[idx].to(device, non_blocking=True)
+
+                loss_acc = 0.0
+                for _ in range(neg_k):
+                    i_neg = torch.randint(0, n_items, (u.shape[0],), device=device)
+
+                    uvec = u_final[u]
+                    pvec = i_final[i_pos]
+                    nvec = i_final[i_neg]
+
+                    s_pos = (uvec * pvec).sum(dim=1)
+                    s_neg = (uvec * nvec).sum(dim=1)
+
+                    loss = -torch.log(torch.sigmoid(s_pos - s_neg) + 1e-8).mean()
+                    loss_acc = loss_acc + loss
+
+                opt.zero_grad(set_to_none=True)
+                loss_acc.backward()
+                opt.step()
+
+                total_loss += float(loss_acc.detach().cpu())
+
+                if verbose and (st + 1) % 200 == 0:
+                    print(f"[LightGCN] ep {ep}/{epochs} step {st+1}/{steps} loss~ {total_loss/(st+1):.4f}")
+
+            if verbose:
+                print(f"[LightGCN] Epoch {ep} avg_loss={total_loss/steps:.4f}")
+
+        # final embeddings
+        model.eval()
+        with torch.no_grad():
+            u_final, i_final = model.propagate()
+
+        if use_cache:
+            try:
+                torch.save(
+                    {
+                        "cache_key": cache_key,
+                        "state_dict": model.state_dict(),
+                        "u_final": u_final.detach().cpu(),
+                        "i_final": i_final.detach().cpu(),
+                        "u_uniques": u_uniques,
+                        "i_uniques": i_uniques,
+                        "bought_dict": bought_dict,
+                    },
+                    cache_path,
+                )
+                if verbose:
+                    print(f"[LightGCN] Saved cache: {cache_path}")
+            except Exception:
+                if verbose:
+                    print("[LightGCN] Warning: could not save cache.")
+    else:
+        # load cached embeddings + mappings
+        model.load_state_dict(cache_obj["state_dict"])
+        u_final = cache_obj["u_final"].to(device)
+        i_final = cache_obj["i_final"].to(device)
+        # use cached bought_dict / uniques (safer)
+        u_uniques = cache_obj["u_uniques"]
+        i_uniques = cache_obj["i_uniques"]
+        bought_dict = cache_obj["bought_dict"]
+
+    # ----------------------------
+    # 4) Retrieval topK candidates
+    # ----------------------------
+    # users to generate for: if customers passed, restrict to those in mapping
+    if customers is None:
+        user_indices = np.arange(n_users, dtype=np.int64)
+    else:
+        # map given customer ids to u_idx (only those present in this window)
+        # build reverse map once
+        u_map = {cid: idx for idx, cid in enumerate(u_uniques)}
+        user_indices = np.array([u_map[c] for c in customers if c in u_map], dtype=np.int64)
+
+    item_T = i_final.t()  # (D, I)
+
+    all_rows = []
+    all_feats = []
+
+    import pandas as pd
+
+    for s in range(0, len(user_indices), retrieval_batch_users):
+        ub = user_indices[s : s + retrieval_batch_users]
+        ub_t = torch.from_numpy(ub).to(device)
+        scores = (u_final[ub_t] @ item_T).float()  # (B, I)
+
+        for bi, u_idx in enumerate(ub):
+            sc = scores[bi]
+
+            bought = bought_dict.get(int(u_idx), None)
+            if bought is not None and len(bought) > 0:
+                sc[bought] = -1e9
+
+            k = min(num_articles, sc.numel())
+            topv, topi = torch.topk(sc, k=k, largest=True, sorted=True)
+
+            cust_id = u_uniques[u_idx]
+            for rank, (it_idx, val) in enumerate(zip(topi.tolist(), topv.tolist()), start=1):
+                art_id = i_uniques[it_idx]
+                all_rows.append((cust_id, art_id))
+                all_feats.append((cust_id, art_id, float(val), int(rank)))
+
+    cand_pd = pd.DataFrame(all_rows, columns=["customer_id", "article_id"]).drop_duplicates()
+    feat_pd = pd.DataFrame(
+        all_feats, columns=["customer_id", "article_id", "gcn_score", "gcn_rank"]
+    ).set_index(["customer_id", "article_id"])
+
+    if _HAS_CUDF and "cudf" in str(type(transactions_df)):
+        graph_candidates = cudf.from_pandas(cand_pd)
+        graph_features_df = cudf.from_pandas(feat_pd.reset_index()).set_index(["customer_id", "article_id"])
+        graph_features = (["customer_id", "article_id"], graph_features_df)
+    else:
+        graph_candidates = cand_pd
+        graph_features = (["customer_id", "article_id"], feat_pd)
+
+    if verbose:
+        print(f"[LightGCN] Generated candidates: {len(graph_candidates):,}")
+
+    return graph_candidates, graph_features
+
 
 def add_features_to_candidates(candidates_df, features, customers_df, articles_df):
     """
