@@ -82,7 +82,7 @@ def day_week_numbers(dates: cudf.Series):
     numbered_days = numbered_days.dt.days
     extra_days = numbered_days.max() % 7
     numbered_days -= extra_days
-    # dùng để chia nguyên applymap để tương thích cudf
+    # integer arithmetic to avoid applymap on cudf Series
     day_weeks = (numbered_days + 6) // 7
     day_weeks_map = cudf.DataFrame(
         {"day_weeks": day_weeks, "unique_dates": unique_dates}
@@ -174,7 +174,6 @@ def create_cust_hier_decay_features(
 
     decay_gamma: higher -> faster decay per week.
     """
-    # bổ sung decay affinity + recency cho các cặp customer - hierarchy
     max_week = transactions_df["week_number"].max()
     transactions_df = transactions_df.copy()
     transactions_df["weeks_ago"] = (max_week - transactions_df["week_number"]).astype(
@@ -330,14 +329,7 @@ def create_cust_t_features(transactions_df, a, features_db):
     features_db["cust_t_features"] = (["customer_id"], ctf_df)
 
 
-def create_art_t_features(transactions_df, articles_df_or_features_db, features_db=None):
-    """
-    articles_df_or_features_db:
-        tương thích ngược: nếu chỉ truyền 2 tham số thì tham số này chính là features_db
-        nếu truyền 3 tham số thì tham số này là articles_df (không dùng ở đây) và features_db là tham số thứ ba
-    """
-    if features_db is None:
-        features_db = articles_df_or_features_db
+def create_art_t_features(transactions_df, features_db):
     atf_df = transactions_df.groupby("article_id")[["sales_channel_id"]].mean()
     atf_df.columns = ["art_sales_channel"]
     atf_df["art_sales_channel"] = atf_df["art_sales_channel"].astype("float32")
@@ -373,7 +365,7 @@ def create_article_cust_features(transactions_df, customers_df, features_db):
 
     features_db["article_customer_age"] = (["article_id"], art_cust_df)
 
-# mở rộng create_lag_features với trend_ratio_7_28 và newness_days
+
 def create_lag_features(transactions_df, articles_df, lag_days, features_db):
     last_date = transactions_df["t_dat"].max()
 
@@ -395,7 +387,6 @@ def create_lag_features(transactions_df, articles_df, lag_days, features_db):
 
     # trend ratio if both 7 and 28 day windows exist
     if 7 in lag_days and 28 in lag_days:
-        # bổ sung trend ratio 7d/28d
         article_counts_df["trend_ratio_7_28"] = article_counts_df[
             "last_7_days_count"
         ] / (article_counts_df["last_28_days_count"] + 1e-3)
@@ -403,7 +394,7 @@ def create_lag_features(transactions_df, articles_df, lag_days, features_db):
             "trend_ratio_7_28"
         ].astype("float32")
 
-    # độ mới của sản phẩm (số ngày tính từ lần xuất hiện đầu)
+    # newness in days from first appearance
     first_seen = transactions_df.groupby("article_id")["t_dat"].min()
     article_counts_df["newness_days"] = last_date - first_seen
     article_counts_df["newness_days"] = article_counts_df["newness_days"].astype(

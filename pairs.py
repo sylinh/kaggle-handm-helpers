@@ -15,7 +15,6 @@ def cudf_groupby_head(df, groupby, head_count):
 def create_pairs(transactions_df, week_number, pairs_per_item, verbose=True):
     # get the dfs
     working_t_df = transactions_df[["customer_id", "article_id", "week_number"]].copy()
-    # đếm tổng khách để tính lift
     total_customers = working_t_df["customer_id"].nunique()
 
     # we'll look for pairs in last week only
@@ -48,7 +47,7 @@ def create_pairs(transactions_df, week_number, pairs_per_item, verbose=True):
         all_cust_counts.columns = ["article_id", "all_customer_counts"]
         all_cust_counts["all_customer_counts"] -= 1  # not him himself
 
-        # get total # of customers who bought the paired article (phuc vu conf B->A va lift)
+        # get total # of customers who bought the paired article
         pair_all_cust_counts = pairs_t_df.groupby("pair_article_id")["customer_id"].nunique()
         pair_all_cust_counts = pair_all_cust_counts.reset_index()
         pair_all_cust_counts.columns = ["pair_article_id", "pair_all_customer_counts"]
@@ -102,13 +101,13 @@ def create_pairs(transactions_df, week_number, pairs_per_item, verbose=True):
             batch_pairs_df["customer_count"] / batch_pairs_df["all_customer_counts"]
         )
 
-        # confidence B->A (dao nguoc)
+        # confidence B->A
         batch_pairs_df["pair_percent_customers"] = (
             batch_pairs_df["customer_count"]
             / batch_pairs_df["pair_all_customer_counts"]
         )
 
-        # lift su dung ty le khach toan cuc
+        # lift using overall customer base
         support = batch_pairs_df["customer_count"] / total_customers
         prob_a = batch_pairs_df["all_customer_counts"] / total_customers
         prob_b = batch_pairs_df["pair_all_customer_counts"] / total_customers

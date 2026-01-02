@@ -1,6 +1,6 @@
 import cudf
 import pandas as pd
-
+import numpy as np  # NEW: cho random walk (np.exp, v.v.)
 
 def cudf_groupby_head(df, groupby, head_count):
     df = df.to_pandas()
@@ -436,3 +436,80 @@ def filter_candidates(candidates, transactions_df, **kwargs):
     candidates = candidates[candidates["article_id"].isin(recent_articles)].copy()
 
     return candidates
+
+def create_random_walk_candidates(
+    transactions_df,
+    article_pairs_df,
+    seed_weeks=12,
+    seed_articles=12,
+    num_steps=2,
+    restart_prob="adaptive",  # float hoặc "adaptive"
+    topk=24,
+    weight_col="customer_count",
+    recency_weight=True,
+    exclude_seed_items=True,
+    customers=None,
+):
+    # Chỉ lấy khách cần thiết
+    if customers is not None:
+        transactions_df = transactions_df[transactions_df["customer_id"].isin(customers)]
+
+    # Seed: các mua gần nhất trong seed_weeks, giới hạn seed_articles
+    last_week = transactions_df["week_number"].max()
+    seed_df = transactions_df.query(f"week_number >= {last_week - seed_weeks + 1}")
+    seed_df = seed_df.sort_values(["customer_id", "t_dat"], ascending=[True, False])
+    seed_df = seed_df.groupby("customer_id").head(seed_articles)
+
+    # Trọng số seed theo recency
+    if recency_weight:
+        max_week = seed_df["week_number"].max()
+        seed_df["seed_w"] = np.exp(-(max_week - seed_df["week_number"]).astype("float32"))
+    else:
+        seed_df["seed_w"] = 1.0
+
+    # Adjacency: chuẩn hóa trọng số outgoing
+    adj_df = article_pairs_df[["article_id", "pair_article_id", weight_col]].copy()
+    adj_df = adj_df.rename(columns={"pair_article_id": "nbr", weight_col: "w"})
+    out_sum = adj_df.groupby("article_id")["w"].sum()
+    adj_df["w"] = adj_df["w"] / adj_df["article_id"].map(out_sum)
+    adj_dict = {}
+    for row in adj_df.to_pandas().itertuples(index=False):
+        adj_dict.setdefault(row.article_id, []).append((row.nbr, row.w))
+
+    rows = []
+    # Chạy RWR cho từng customer; chuyển seed_df sang pandas để iterate an toàn
+    seed_pd = seed_df.to_pandas()
+    for cust, grp in seed_pd.groupby("customer_id"):
+        p0 = {}
+        for r in grp.itertuples(index=False):
+            p0[r.article_id] = p0.get(r.article_id, 0.0) + float(r.seed_w)
+        norm = sum(p0.values()) + 1e-9
+        for k in p0:
+            p0[k] /= norm
+        p = dict(p0)
+        if restart_prob == "adaptive":
+            r_prob = min(0.4, max(0.15, 0.05 * len(p0)))
+        else:
+            r_prob = float(restart_prob)
+        for _ in range(num_steps):
+            prop = {}
+            for art, w in p.items():
+                if art not in adj_dict:
+                    continue
+                for nbr, aw in adj_dict[art]:
+                    prop[nbr] = prop.get(nbr, 0.0) + w * aw
+            p = {k: r_prob * p0.get(k, 0.0) + (1 - r_prob) * prop.get(k, 0.0) for k in set(p0) | set(prop)}
+        if exclude_seed_items:
+            for k in list(p.keys()):
+                if k in p0:
+                    p.pop(k, None)
+        top_items = sorted(p.items(), key=lambda x: x[1], reverse=True)[:topk]
+        for art, score in top_items:
+            rows.append((cust, art, score))
+
+    if not rows:
+        return cudf.DataFrame(columns=["customer_id", "article_id"]), (["customer_id", "article_id"], cudf.DataFrame())
+
+    rw_df = cudf.DataFrame(rows, columns=["customer_id", "article_id", "rw_score"])
+    features = (["customer_id", "article_id"], rw_df.set_index(["customer_id", "article_id"]))
+    return rw_df[["customer_id", "article_id"]].drop_duplicates(), features

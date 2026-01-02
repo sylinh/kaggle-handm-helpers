@@ -328,7 +328,10 @@ def full_sub_train_run(t, c, a, cand_features_func, score_func, **kwargs):
         train_truth_df,
     ) = prepare_concat_train_modeling_dfs(t, c, a, cand_features_func, **kwargs)
 
-    model = LGBMRanker(**(kwargs["lgbm_params"]), seed=42)
+    model_name = kwargs.get("model_name", f"model_{kwargs['label_week']}")
+    seed = kwargs.get("seed", 42)
+
+    model = LGBMRanker(**(kwargs["lgbm_params"]), seed=seed)
 
     eval_set = [(train_X, train_y)]
     eval_group = [train_group_lengths]
@@ -349,7 +352,7 @@ def full_sub_train_run(t, c, a, cand_features_func, score_func, **kwargs):
     )
 
     # save/reload model
-    model_path = f"model_{kwargs['label_week']}"
+    model_path = model_name
     model.booster_.save_model(model_path)
     model = ForestInference.load(model_path, model_type="lightgbm", output_class=False)
 
@@ -359,6 +362,60 @@ def full_sub_train_run(t, c, a, cand_features_func, score_func, **kwargs):
     print("Train score: ", score_func(train_ids_df, train_pred, train_truth_df))
 
     del train_X, train_y, train_group_lengths, train_truth_df, train_pred
+    return model_path
+
+
+def train_ensemble_models(
+    t, c, a, cand_features_func, score_func, ensemble_configs, base_params
+):
+    """
+    Train multiple models for ensemble.
+
+    Args:
+        t, c, a: transactions, customers, articles dataframes
+        cand_features_func: function to create candidates with features
+        score_func: scoring function
+        ensemble_configs: list of dicts, each containing model-specific configs:
+            - model_name: name to save the model
+            - seed: random seed (optional, default from base_params)
+            - lgbm_params: LightGBM parameters (optional, merged with base_params["lgbm_params"])
+            - other params override base_params
+        base_params: base parameters dict (copied for each model)
+
+    Returns:
+        list of model paths that were trained
+    """
+    trained_models = []
+
+    for i, model_config in enumerate(ensemble_configs):
+        print(f"\n{'='*60}")
+        default_name = f"model_{base_params.get('label_week', 'unknown')}_ensemble{i}"
+        model_name = model_config.get("model_name", default_name)
+        print(f"Training ensemble model {i+1}/{len(ensemble_configs)}: {model_name}")
+        print(f"{'='*60}")
+
+        # Copy base params and update with model-specific configs
+        model_params = copy.deepcopy(base_params)
+
+        for key, value in model_config.items():
+            if key not in ["model_name", "seed", "lgbm_params"]:
+                model_params[key] = value
+
+        if "lgbm_params" in model_config:
+            model_lgbm_params = copy.deepcopy(base_params.get("lgbm_params", {}))
+            model_lgbm_params.update(model_config["lgbm_params"])
+            model_params["lgbm_params"] = model_lgbm_params
+
+        model_params["model_name"] = model_name
+        if "seed" in model_config:
+            model_params["seed"] = model_config["seed"]
+
+        model_path = full_sub_train_run(t, c, a, cand_features_func, score_func, **model_params)
+        trained_models.append(model_path)
+
+        print(f"Model '{model_path}' trained successfully\n")
+
+    return trained_models
 
 
 def full_sub_predict_run(t, c, a, cand_features_func, **kwargs):
